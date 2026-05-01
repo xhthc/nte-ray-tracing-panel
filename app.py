@@ -84,6 +84,7 @@ APP_SEARCH_KEYWORDS = [
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 22642
 GITHUB_RELEASE_API = "https://api.github.com/repos/optiscaler/OptiScaler/releases/latest"
+SEVEN_ZIPR_URL = "https://github.com/ip7z/7zip/releases/download/26.01/7zr.exe"
 GAME_EXE = "HTGame.exe"
 
 RUN_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -458,6 +459,79 @@ def find_optiscaler_stage() -> dict | None:
     return {"dir": str(folder), "dll": str(dll), "ini": str(ini), "tag": folder.name}
 
 
+def seven_zip_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    for exe in ("7z", "7za", "7zr"):
+        found = shutil.which(exe)
+        if found:
+            candidates.append(Path(found))
+    for path in (
+        RESOURCE_DIR / "tools" / "7zr.exe",
+        RUN_DIR / "tools" / "7zr.exe",
+        TOOLS_DIR / "_bin" / "7zr.exe",
+    ):
+        if path.is_file():
+            candidates.append(path)
+    return candidates
+
+
+def ensure_seven_zipr() -> Path:
+    for candidate in seven_zip_candidates():
+        return candidate
+
+    target = TOOLS_DIR / "_bin" / "7zr.exe"
+    download_file(SEVEN_ZIPR_URL, target)
+    if not target.is_file() or target.stat().st_size < 100_000:
+        raise AppError("7zr.exe download failed or produced an invalid file.", 500)
+    return target
+
+
+def extract_with_seven_zip(seven_zip: Path, archive: Path, extract_dir: Path) -> tuple[bool, str]:
+    proc = run_command([str(seven_zip), "x", "-y", f"-o{extract_dir}", str(archive)], timeout=180)
+    if proc.returncode == 0:
+        return True, ""
+    return False, (proc.stderr or proc.stdout or f"{seven_zip.name} failed").strip()
+
+
+def extract_optiscaler_archive(archive: Path, extract_dir: Path) -> None:
+    errors = []
+
+    try:
+        seven_zip = ensure_seven_zipr()
+        ok, error = extract_with_seven_zip(seven_zip, archive, extract_dir)
+        if ok:
+            return
+        errors.append(error)
+    except Exception as exc:
+        errors.append(f"7zr: {exc}")
+
+    try:
+        import py7zr  # type: ignore
+
+        with py7zr.SevenZipFile(archive, mode="r") as zf:
+            zf.extractall(path=extract_dir)
+        return
+    except ImportError:
+        errors.append("py7zr is not installed")
+    except Exception as exc:
+        errors.append(f"py7zr: {exc}")
+
+    tar = shutil.which("tar")
+    if tar:
+        proc = run_command([tar, "-xf", str(archive), "-C", str(extract_dir)], timeout=180)
+        if proc.returncode == 0:
+            return
+        errors.append((proc.stderr or proc.stdout or "tar failed").strip())
+    else:
+        errors.append("Windows tar.exe was not found")
+
+    detail = "; ".join(item for item in errors if item)
+    raise AppError(
+        "OptiScaler archive extraction failed. Could not extract the .7z archive. " + detail,
+        500,
+    )
+
+
 def ensure_optiscaler(force: bool = False) -> dict:
     existing = find_optiscaler_stage()
     if existing and not force:
@@ -472,15 +546,10 @@ def ensure_optiscaler(force: bool = False) -> dict:
     if force or not archive.is_file():
         download_file(str(release["assetUrl"]), archive)
     extract_dir.mkdir(parents=True, exist_ok=True)
-    tar = shutil.which("tar")
-    if not tar:
-        raise AppError("未找到 Windows tar.exe，无法解压 OptiScaler .7z。", 500)
-    proc = run_command([tar, "-xf", str(archive), "-C", str(extract_dir)], timeout=180)
-    if proc.returncode != 0:
-        raise AppError(proc.stderr.strip() or "OptiScaler 解压失败。", 500)
+    extract_optiscaler_archive(archive, extract_dir)
     stage = find_optiscaler_stage()
     if not stage:
-        raise AppError("OptiScaler 已下载但未找到 OptiScaler.dll。", 500)
+        raise AppError("OptiScaler was downloaded but OptiScaler.dll was not found.", 500)
     stage.update({"downloaded": True, "release": release, "archive": str(archive)})
     return stage
 
